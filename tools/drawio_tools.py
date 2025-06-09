@@ -25,59 +25,195 @@ except Exception as e:
     print(f"Errore durante l'inizializzazione del client GenAI: {e}")
     client = None # o gestire l'errore come appropriato
 
-DRAWIO_SYSTEM_INSTRUCTIONS = """
-You are an expert Draw.io diagram generator.
-Your task is to create a Draw.io XML representation of an image, based on the original image and a list of identified objects within it.
-The output must be a single, valid Draw.io XML string, without any surrounding text or markdown.
-Do not include any other text, explanations, or markdown code fencing (e.g., ```xml ... ```) around the XML.
-The diagram should represent the spatial arrangement and composition of the original image. The Draw.io file and the image assets are both located in the 'output_llm' subdirectory.
-Therefore, image paths within the Draw.io XML must be relative to the location of the Draw.io file itself. Since both are in 'output_llm', the path should be just the filename, e.g., 'object_name.png'.
-Use the object name (e.g., 'object_name' extracted from '../output_llm/object_name.png') as the `value` (label) for the `mxCell` if a label is desired, or leave `value` empty for image-only objects.
+import base64
+import mimetypes
+import os
+import re
+from xml.etree import ElementTree as ET
+from typing import Optional
 
-A basic Draw.io XML structure looks like this (ensure `compressed="false"`):
-<mxfile compressed="false" host="GeminiAgent" version="1.0" type="device">
-  <diagram id="diagram-1" name="Page-1">
-    <mxGraphModel dx="1000" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
-      <root>
-        <mxCell id="0" />
-        <mxCell id="1" parent="0" />
-        <!-- Example of a generic shape object -->
-        <mxCell id="obj_rect_id_1" value="LabelForRect" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="200" y="150" width="120" height="60" as="geometry" />
-        </mxCell>
-        <!-- Example of an embedded image object:
-             'value' can be the object name (e.g., 'example_object') or empty.
-             'image' attribute in style must point to the relative path of the image asset.
-             The path should be like 'example_object.png'.
-             'shape=image' is crucial. 'imageAspect=0' allows stretching if needed, 'imageAspect=1' preserves aspect ratio.
-             'aspect=fixed' can be used if the geometry itself should maintain its aspect ratio when resized manually. -->
-        <mxCell id="obj_img_id_1" value="example_object" style="shape=image;html=1;imageAspect=0;image=example_object.png;" vertex="1" parent="1">
-          <mxGeometry x="400" y="150" width="100" height="80" as="geometry" />
-        </mxCell>
-        <!-- Add more mxCell elements for other objects and their relationships. Ensure unique 'id' for each mxCell. -->
-      </root>
-    </mxGraphModel>
-  </diagram>
-</mxfile>
-Adapt this structure. Ensure all `mxCell` elements have unique `id` attributes. Ensure image paths are direct filenames like 'asset.png', as they are in the same directory as the .drawio file.
-The `x`, `y`, `width`, `height` attributes in `mxGeometry` should reflect the object's approximate position and size in the original image.
-When using an image asset (e.g., from '../output_llm/object.png'), its `mxGeometry` should ideally correspond to the detected object's bounding box in the original image, scaled appropriately for the diagram.
-"""
+def convert_image_to_base64(image_path: str) -> Optional[str]:
+    """
+    Converte un'immagine in stringa base64 nel formato Draw.io
+    
+    Args:
+        image_path: Percorso del file immagine
+        
+    Returns:
+        Stringa base64 nel formato Draw.io (data:image/type,base64_data) o None se errore
+    """
+    if not os.path.exists(image_path):
+        print(f"Warning: Image {image_path} not found")
+        return None
+        
+    try:
+        # Determina il MIME type
+        mime_type, _ = mimetypes.guess_type(image_path)
+        if not mime_type or not mime_type.startswith('image/'):
+            mime_type = 'image/png'  # default fallback
+        
+        # Leggi e converti in base64
+        with open(image_path, 'rb') as img_file:
+            img_data = img_file.read()
+            base64_str = base64.b64encode(img_data).decode('utf-8')
+            
+        # Formato Draw.io: data:image/type,base64_data (SENZA ;base64)
+        return f"data:{mime_type},{base64_str}"
+        
+    except Exception as e:
+        print(f"Error converting {image_path} to base64: {e}")
+        return None
 
-@tool("drawio_generator_tool")
+def replace_image_references_in_drawio_xml(xml_content: str, base_folder: str = "output_llm") -> str:
+    """
+    Sostituisce tutti i riferimenti alle immagini nell'XML Draw.io con versioni base64
+    
+    Args:
+        xml_content: Contenuto XML Draw.io come stringa
+        base_folder: Cartella base dove cercare le immagini
+        
+    Returns:
+        XML modificato con immagini base64 embedded
+    """
+    try:
+        # Pattern per trovare riferimenti alle immagini negli attributi style
+        # Cerca pattern come: image=filename.png o image='filename.png' o image="filename.png"
+        image_patterns = [
+            r'image=([\'"]?)([^\'";,\s]+\.(png|jpg|jpeg|gif|bmp|svg))\1',  # image=file.png, image='file.png', image="file.png"
+            r'image=([\'"]?)(file://\.?/?([^\'";,\s]+\.(png|jpg|jpeg|gif|bmp|svg)))\1',  # image=file://./file.png
+        ]
+        
+        modified_xml = xml_content
+        processed_files = set()  # Per evitare conversioni duplicate
+        
+        for pattern in image_patterns:
+            matches = re.finditer(pattern, modified_xml, re.IGNORECASE)
+            
+            for match in matches:
+                full_match = match.group(0)
+                quote_char = match.group(1) if match.group(1) else ''
+                
+                # Estrai il nome del file
+                if 'file://' in full_match:
+                    # Per pattern file://./filename.png
+                    filename = match.group(3) if len(match.groups()) >= 3 else match.group(2)
+                else:
+                    # Per pattern semplici
+                    filename = match.group(2)
+                
+                # Rimuovi eventuali prefissi di path
+                filename = os.path.basename(filename)
+                
+                if filename in processed_files:
+                    continue
+                    
+                processed_files.add(filename)
+                image_path = os.path.join(base_folder, filename)
+                
+                # Converti in base64
+                base64_data = convert_image_to_base64(image_path)
+                
+                if base64_data:
+                    # Sostituisci tutti i riferimenti a questo file
+                    old_patterns = [
+                        f'image={quote_char}{filename}{quote_char}',
+                        f'image={quote_char}file://\./{filename}{quote_char}',
+                        f'image={quote_char}file://{filename}{quote_char}',
+                        f'image={filename}',  # senza quote
+                    ]
+                    
+                    new_value = f'image={quote_char}{base64_data}{quote_char}' if quote_char else f'image={base64_data}'
+                    
+                    for old_pattern in old_patterns:
+                        modified_xml = modified_xml.replace(old_pattern, new_value)
+                    
+                    print(f"Replaced image reference: {filename} -> base64 ({len(base64_data)} chars)")
+                else:
+                    print(f"Failed to convert image: {filename}")
+        
+        return modified_xml
+        
+    except Exception as e:
+        print(f"Error processing XML: {e}")
+        return xml_content  # Ritorna l'originale in caso di errore
+
+def replace_image_references_xml_parser(xml_content: str, base_folder: str = "output_llm") -> str:
+    """
+    Versione alternativa che usa XML parser per maggiore precisione
+    Sostituisce i riferimenti alle immagini negli attributi style dei mxCell
+    """
+    try:
+        # Parse dell'XML
+        root = ET.fromstring(xml_content)
+        
+        # Trova tutti gli elementi mxCell con attributo style contenente image=
+        for cell in root.iter('mxCell'):
+            style = cell.get('style', '')
+            if 'image=' in style:
+                # Estrai il valore dell'immagine dallo style
+                style_parts = style.split(';')
+                new_style_parts = []
+                
+                for part in style_parts:
+                    if part.startswith('image='):
+                        # Estrai il nome del file
+                        image_ref = part[6:]  # Rimuovi 'image='
+                        
+                        # Rimuovi eventuali quote
+                        if image_ref.startswith('"') and image_ref.endswith('"'):
+                            image_ref = image_ref[1:-1]
+                        elif image_ref.startswith("'") and image_ref.endswith("'"):
+                            image_ref = image_ref[1:-1]
+                        
+                        # Gestisci file:// prefix
+                        if image_ref.startswith('file://'):
+                            image_ref = image_ref.replace('file://', '').lstrip('./')
+                        
+                        filename = os.path.basename(image_ref)
+                        image_path = os.path.join(base_folder, filename)
+                        
+                        # Converti in base64
+                        base64_data = convert_image_to_base64(image_path)
+                        
+                        if base64_data:
+                            new_style_parts.append(f'image={base64_data}')
+                            print(f"XML Parser: Replaced {filename} with base64 data")
+                        else:
+                            new_style_parts.append(part)  # Mantieni originale se conversione fallisce
+                    else:
+                        new_style_parts.append(part)
+                
+                # Ricostruisci lo style
+                cell.set('style', ';'.join(new_style_parts))
+        
+        # Converti back in stringa
+        return ET.tostring(root, encoding='unicode')
+        
+    except ET.ParseError as e:
+        print(f"XML parsing error: {e}")
+        # Fallback al metodo regex
+        return replace_image_references_in_drawio_xml(xml_content, base_folder)
+    except Exception as e:
+        print(f"Error in XML parser method: {e}")
+        return xml_content
+
+@tool("generate_drawio_from_image_and_objects_tool", parse_docstring=True) # Uncomment if you plan to use it directly as a langchain tool
 def generate_drawio_from_image_and_objects(original_image_path: str, object_names: list[str]) -> str:
     """
-    Genera una rappresentazione XML Draw.io di un'immagine,
-    utilizzando l'immagine originale e una lista di nomi di oggetti identificati.
+    Generates a Draw.io XML diagram from an original image and a list of detected object names.
+
+    The function first instructs a generative model to create a Draw.io XML representation
+    of the scene in the original image. It then incorporates references to cropped images
+    of specified objects (expected to be in the 'output_llm' folder).
+    Finally, it post-processes this XML to replace all local image file references
+    with their base64 encoded data, making the Draw.io diagram self-contained.
 
     Args:
-        original_image_path (str): Il percorso del file dell'immagine originale.
-        object_names (list[str]): Una lista di nomi di file (con estensione, es. "gatto.png", "sedia.jpg")
-                                   per le immagini degli oggetti precedentemente estratti e salvati nella cartella "output_llm/".
-                                   Questi verranno usati come asset nel diagramma.
+        original_image_path (str): The file path to the original image to be diagrammed.
+        object_names (list[str]): A list of object names (e.g., ['cat.png', 'dog.png']) that have been previously detected and saved as image files in the 'output_llm' folder. These will be embedded into the diagram.
 
     Returns:
-        str: Una stringa XML Draw.io che rappresenta l'immagine, o un messaggio di errore.
+        bool: True if the Draw.io XML was successfully generated and saved, or an error message if something went wrong.
     """
     if not GOOGLE_API_KEY or not client:
         return "Errore: GEMINI_API_KEY non configurato o client non inizializzato."
@@ -88,64 +224,127 @@ def generate_drawio_from_image_and_objects(original_image_path: str, object_name
         original_image = Image.open(BytesIO(img_bytes))
         original_image.thumbnail([1024, 1024], Image.Resampling.LANCZOS)
 
-        object_image_folder = "output_llm"  # Cartella dove sono salvate le immagini degli oggetti
+        object_image_folder = "output_llm"
 
         prompt_parts = [
             "Generate a Draw.io XML diagram for the provided original image.",
             "The diagram should represent the overall scene, focusing on spatial relationships and composition."
         ]
 
-        if object_names: # e.g., ["cat.png", "dog.png"]
-            # Create a string like "'cat.png', 'dog.png'" for the prompt
+        if object_names:
             object_filenames_str = ", ".join([f"'{name}'" for name in object_names])
-            prompt_parts.append(
-                f"Incorporate the following pre-detected object images as assets in your diagram: {object_filenames_str}."
-            )
-            prompt_parts.append(
-                f"These image assets (e.g., 'cat.png') are located in the '{object_image_folder}' directory. "
-                f"The Draw.io XML file itself will also be saved in this same '{object_image_folder}' directory."
-            )
-            prompt_parts.append(
-                f"Therefore, when referencing an asset like 'cat.png' in the Draw.io XML, the 'image' attribute "
-                f"within the 'style' string of an 'mxCell' element must be just the filename. "
-                f"For example: style='shape=image;html=1;imageAspect=0;image=cat.png;'."
-            )
-            prompt_parts.append(
-                f"For the 'value' attribute (label) of these image mxCell elements, you can use the base name of the object "
-                f"(e.g., for 'cat.png', use 'cat' as the label), or leave it empty if a label is not visually appropriate."
-            )
+            prompt_parts.extend([
+                f"Incorporate the following object images as assets: {object_filenames_str}.",
+                f"These images are in the '{object_image_folder}' directory.",
+                "Use simple filename references in the image attribute, like: image=cat.png",
+                "Do NOT use base64 encoding - just use the filename directly.",
+                "The image paths will be processed later to embed the actual image data."
+            ])
 
-        prompt_parts.append("Arrange all elements to reflect their spatial relationships and the overall composition of the original scene.")
-        prompt_parts.append("The diagram should visually correspond to the input image.")
+        prompt_parts.extend([
+            "Position and size elements based on their approximate location in the original image.",
+            "Create complete Draw.io XML structure with proper mxGraphModel, root, and mxCell elements.",
+            "Ensure all mxCell elements have unique id attributes."
+        ])
+        
         user_prompt = " ".join(prompt_parts)
+
+        # System instructions semplificato per riferimenti diretti
+        simple_ref_instructions = """
+You are an expert Draw.io diagram generator.
+Create Draw.io XML using simple filename references for images.
+
+Structure:
+<mxfile compressed="false" host="GeminiAgent" version="1.0" type="device">
+  <diagram id="diagram-1" name="Page-1">
+    <mxGraphModel dx="1000" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <mxCell id="obj_1" value="object_name" style="shape=image;html=1;imageAspect=1;aspect=fixed;image=filename.png" vertex="1" parent="1">
+          <mxGeometry x="100" y="100" width="80" height="60" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
+
+Use simple filename references like 'image=cat.png' - do NOT embed base64 data.
+Position elements to match the original image layout.
+"""
 
         response = client.models.generate_content(
             contents=[user_prompt, original_image],
             model=MODEL_NAME,
-                config = types.GenerateContentConfig( # Corretto da 'config' a 'generation_config'
-                system_instruction=DRAWIO_SYSTEM_INSTRUCTIONS, # system_instruction non è un parametro di GenerationConfig
+            config=types.GenerateContentConfig(
+                system_instruction=simple_ref_instructions,
                 temperature=0,
-                safety_settings=[ # Impostazioni di sicurezza simili a quelle di object_detection_tools.py
-                types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
-                types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
-                types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_ONLY_HIGH"),
-                types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
-            ]
+                safety_settings=[
+                    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
+                    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
+                    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_ONLY_HIGH"),
+                    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
+                ]
             )
         )
 
         xml_output = response.text.strip()
-        if xml_output.startswith("```xml"): xml_output = xml_output[len("```xml"):]
-        if xml_output.endswith("```"): xml_output = xml_output[:-len("```")]
-        return xml_output.strip()
+        
+        # Clean up markdown formatting
+        if xml_output.startswith("```xml"): 
+            xml_output = xml_output[len("```xml"):]
+        if xml_output.endswith("```"): 
+            xml_output = xml_output[:-len("```")]
+        
+        xml_output = xml_output.strip()
+        
+        # POST-PROCESSING: Sostituisci i riferimenti con base64
+        print("Post-processing: Converting image references to base64...")
+        final_xml = replace_image_references_xml_parser(xml_output, object_image_folder)
+        save_drawio_xml(final_xml, "drawio_output", output_directory="output_llm")
+
+        return True
 
     except FileNotFoundError:
         return f"Errore: File immagine originale non trovato a {original_image_path}."
     except Exception as e:
-        print(f"Errore dettagliato in generate_drawio_from_image_and_objects: {e}")
+        print(f"Errore dettagliato in generate_drawio_from_image_and_objects_v4: {e}")
         return f"Errore durante la generazione dell'XML Draw.io: {str(e)}"
 
-@tool("drawio_saver_tool")
+# Funzione standalone per post-processare XML esistenti
+def post_process_drawio_xml_file(xml_file_path: str, base_folder: str = "output_llm", output_path: str = None) -> str:
+    """
+    Post-processa un file XML Draw.io esistente per sostituire i riferimenti alle immagini
+    
+    Args:
+        xml_file_path: Percorso del file XML Draw.io
+        base_folder: Cartella base per le immagini
+        output_path: Percorso di output (se None, sovrascrive l'originale)
+        
+    Returns:
+        Percorso del file processato
+    """
+    try:
+        with open(xml_file_path, 'r', encoding='utf-8') as f:
+            xml_content = f.read()
+        
+        processed_xml = replace_image_references_xml_parser(xml_content, base_folder)
+        
+        if output_path is None:
+            output_path = xml_file_path
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(processed_xml)
+        
+        print(f"Processed XML saved to: {output_path}")
+        return output_path
+        
+    except Exception as e:
+        print(f"Error processing XML file: {e}")
+        return xml_file_path
+    
+
 def save_drawio_xml(xml_content: str, filename_prefix: str, output_directory: str = "output_llm") -> str:
     """
     Salva una stringa XML di Draw.io in un file .drawio.
