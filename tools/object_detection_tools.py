@@ -16,7 +16,11 @@ model_name = "gemini-2.5-pro-preview-06-05" # @param ["gemini-1.5-flash-latest",
 # System instructions per guidare il modello a restituire i bounding box in formato JSON.
 bounding_box_system_instructions = """
     Return bounding boxes as a JSON array with labels. Never return masks or code fencing. Limit to 25 objects.
-    If an object is present multiple times, name them according to their unique characteristic (colors, size, position, unique characteristics, etc..).
+    If two object are the same, understand if they have different labels or not, and if they do, return them as two different objects, othewrise return just one object.
+    The image you are analyzing is a 2D diagram image, you should return the boung boxes of the singular pics of the architecture,
+    not the composition of multiple pics or the whole image.
+    The label you assign should be as more specific as possible to allow the user to understand what the object is. If there is any space in the label, insert underscore between the words.
+    If some pics in the images contain labels, try to exclude them from the bounding boxes (unless they overlap with the object you are bounding).
       """
 
 safety_settings = [
@@ -59,9 +63,9 @@ def detect_objects_in_image(img_path: str) -> str:
                 safety_settings=safety_settings,
             )
         )
-
-        plot_bounding_boxes(im, response.text)
+        
         save_cropped_images(im, response.text, output_folder="output_llm")
+        plot_bounding_boxes(im, response.text)
 
         return response.text
     except FileNotFoundError:
