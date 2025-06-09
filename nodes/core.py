@@ -33,7 +33,6 @@ chat = ChatGoogleGenerativeAI(
 tools = [
     object_detection_tool,
     drawio_tool,
-    drawio_saver_tool
 ]
 
 chat_with_tools = chat.bind_tools(tools)
@@ -41,8 +40,7 @@ chat_with_tools = chat.bind_tools(tools)
 def assistant(state: AgentState):
     sys_msg = "You are a helpful assistant with access to tools. Your goal is to generate a drawio file following the steps:" \
     "- Extract objects from the original image that user provides" \
-    "- Generate a drawio using the images extracted at the previous step" \
-    "- Save the drawio file and provide the path to the user" 
+    "- Generate a drawio using the images extracted at the previous step"
     return {
         "messages": [chat_with_tools.invoke([sys_msg] + state["messages"])]
     }
