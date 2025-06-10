@@ -1,7 +1,7 @@
 import os
 from langfuse.callback import CallbackHandler
 from langchain_core.messages import HumanMessage
-from graph.graph_builder import graph
+from nodes.core import graph
 
 langfuse_secret_key = os.getenv("LANGFUSE_SECRET_KEY")
 langfuse_public_key = os.getenv("LANGFUSE_PUBLIC_KEY")

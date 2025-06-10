@@ -139,10 +139,10 @@ def save_cropped_images(
 
         # Converte coordinate normalizzate in coordinate assolute
         # box_2d è [y1, x1, y2, x2]
-        abs_y1 = int(bounding_box["box_2d"][0] / NORMALIZATION_DIVISOR * height)
-        abs_x1 = int(bounding_box["box_2d"][1] / NORMALIZATION_DIVISOR * width)
-        abs_y2 = int(bounding_box["box_2d"][2] / NORMALIZATION_DIVISOR * height)
-        abs_x2 = int(bounding_box["box_2d"][3] / NORMALIZATION_DIVISOR * width)
+        abs_y1 = round(bounding_box["box_2d"][0] / NORMALIZATION_DIVISOR * height)
+        abs_x1 = round(bounding_box["box_2d"][1] / NORMALIZATION_DIVISOR * width)
+        abs_y2 = round(bounding_box["box_2d"][2] / NORMALIZATION_DIVISOR * height)
+        abs_x2 = round(bounding_box["box_2d"][3] / NORMALIZATION_DIVISOR * width)
 
         # Assicura che abs_x1 sia sinistra, abs_x2 destra, abs_y1 alto, abs_y2 basso
         # per la funzione crop di PIL che richiede (left, upper, right, lower)

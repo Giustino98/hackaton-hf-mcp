@@ -1,11 +1,15 @@
 import os
+import json # Added for JSON parsing
 from google import genai
 from google.genai import types
 from PIL import Image
 from io import BytesIO
 from langchain_core.tools import tool
-
+from langfuse import Langfuse
+from langfuse.decorators import observe, langfuse_context
 GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-pro-preview-06-05")
+GEMINI_THINKING_BUDGET = int(os.getenv("GEMINI_THINKING_BUDGET", "128"))
 
 if not GOOGLE_API_KEY:
     # Consider raising an error or logging if the API key is critical for module loading
@@ -15,7 +19,7 @@ if not GOOGLE_API_KEY:
 # Utilizziamo lo stesso modello specificato in object_detection_tools.py per coerenza,
 # o un modello potente per la generazione come "gemini-1.5-pro-latest".
 # Se "gemini-2.5-pro-preview-06-05" è disponibile e preferito:
-MODEL_NAME = "gemini-2.5-pro-preview-06-05"
+MODEL_NAME = GEMINI_MODEL_NAME
 # Altrimenti, un'opzione robusta:
 # MODEL_NAME = "gemini-1.5-pro-latest"
 
@@ -25,12 +29,36 @@ except Exception as e:
     print(f"Errore durante l'inizializzazione del client GenAI: {e}")
     client = None # o gestire l'errore come appropriato
 
+# Global safety settings
+SAFETY_SETTINGS = [
+    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
+    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
+    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_ONLY_HIGH"),
+    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
+]
+
+# Langfuse initialization
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
+LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "http://localhost:3000") # Default to local if not set
+
+if LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY:
+    try:
+        Langfuse(
+            public_key=LANGFUSE_PUBLIC_KEY,
+            secret_key=LANGFUSE_SECRET_KEY,
+            host=LANGFUSE_HOST
+        )
+        print(f"Langfuse tracing enabled for {__name__}")
+    except Exception as e:
+        print(f"Failed to initialize Langfuse for {__name__}: {e}. Tracing will be disabled.")
+
 import base64
 import mimetypes
 import os
 import re
 from xml.etree import ElementTree as ET
-from typing import Optional
+from typing import Optional, Dict, Any, List as TypingList
 
 def convert_image_to_base64(image_path: str) -> Optional[str]:
     """
@@ -197,7 +225,9 @@ def replace_image_references_xml_parser(xml_content: str, base_folder: str = "ou
         print(f"Error in XML parser method: {e}")
         return xml_content
 
+
 @tool("generate_drawio_from_image_and_objects_tool", parse_docstring=True) # Uncomment if you plan to use it directly as a langchain tool
+@observe(as_type="generation")
 def generate_drawio_from_image_and_objects(original_image_path: str, object_names: list[str]) -> str:
     """
     Generates a Draw.io XML diagram from an original image and a list of detected object names.
@@ -274,19 +304,39 @@ Use simple filename references like 'image=cat.png' - do NOT embed base64 data.
 Position elements to match the original image layout.
 """
 
+        # System instructions per la verifica e correzione dell'XML
+        verify_correct_xml_instructions = """
+You are an expert Draw.io diagram verifier and corrector.
+You will be given an original image and a Draw.io XML generated for that image.
+Your task is to:
+1. Verify if the XML accurately represents the objects, their positions, sizes, and connections as shown in the original image.
+2. Correct any inaccuracies in the XML. This includes adjusting positions, sizes, shapes, or connections.
+3. Ensure all image references within the XML use simple filename references (e.g., image=filename.png). Do NOT use base64 encoding.
+4. Ensure the XML structure is valid Draw.io format.
+Return ONLY the corrected Draw.io XML. Do not include any other text, explanations, or markdown formatting around the XML.
+If the XML is already perfect, return it as is.
+Focus on accuracy of representation and valid Draw.io XML output.
+"""
+
         response = client.models.generate_content(
             contents=[user_prompt, original_image],
             model=MODEL_NAME,
             config=types.GenerateContentConfig(
                 system_instruction=simple_ref_instructions,
                 temperature=0,
-                safety_settings=[
-                    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
-                    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
-                    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_ONLY_HIGH"),
-                    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
-                ]
+                safety_settings=SAFETY_SETTINGS,
+                thinking_config=types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
             )
+        )
+
+        langfuse_context.update_current_observation(
+            input=[user_prompt, original_image],
+            model=MODEL_NAME,
+            usage_details={
+                "input": response.usage_metadata.prompt_token_count,
+                "output": response.usage_metadata.candidates_token_count,
+                "total": response.usage_metadata.total_token_count
+            }
         )
 
         xml_output = response.text.strip()
@@ -299,10 +349,47 @@ Position elements to match the original image layout.
         
         xml_output = xml_output.strip()
         
+        # SECONDA CHIAMATA LLM: Verifica e correzione dell'XML generato
+        print("Second LLM call: Verifying and correcting generated XML...")
+        verification_prompt_parts = [
+            original_image, # L'immagine originale
+            f"Generated Draw.io XML to verify and correct:\n{xml_output}", # L'XML generato
+            "Please verify this XML against the original image. Correct any errors in object placement, connections, or representation. Ensure all image references are simple filenames like 'image=filename.png'. Return only the corrected Draw.io XML."
+        ]
+
+        correction_response = client.models.generate_content(
+            contents=verification_prompt_parts,
+            model=MODEL_NAME,
+            config=types.GenerateContentConfig(
+                system_instruction=verify_correct_xml_instructions,
+                temperature=0, # Bassa temperatura per output più deterministico/corretto
+                safety_settings=SAFETY_SETTINGS,
+                thinking_config=types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
+            )
+        )
+
+        langfuse_context.update_current_observation(
+            input=verification_prompt_parts, # Aggiorna l'input per il trace della correzione
+            model=MODEL_NAME,
+            metadata={"step": "xml_correction"}, # Aggiungi metadati per distinguere questa chiamata
+            usage_details={
+                "input": correction_response.usage_metadata.prompt_token_count,
+                "output": correction_response.usage_metadata.candidates_token_count,
+                "total": correction_response.usage_metadata.total_token_count
+            }
+        )
+
+        xml_output = correction_response.text.strip() # Sovrascrivi xml_output con la versione corretta
+        if xml_output.startswith("```xml"): xml_output = xml_output[len("```xml"):]
+        if xml_output.endswith("```"): xml_output = xml_output[:-len("```")]
+        xml_output = xml_output.strip()
+        print("XML verification/correction complete.")
+
         # POST-PROCESSING: Sostituisci i riferimenti con base64
         print("Post-processing: Converting image references to base64...")
         final_xml = replace_image_references_xml_parser(xml_output, object_image_folder)
-        save_drawio_xml(final_xml, "drawio_output", output_directory="output_llm")
+        save_message = save_drawio_xml(final_xml, "drawio_output", output_directory="output_llm")
+        print(save_message)
 
         return True
 
@@ -311,6 +398,7 @@ Position elements to match the original image layout.
     except Exception as e:
         print(f"Errore dettagliato in generate_drawio_from_image_and_objects_v4: {e}")
         return f"Errore durante la generazione dell'XML Draw.io: {str(e)}"
+
 
 # Funzione standalone per post-processare XML esistenti
 def post_process_drawio_xml_file(xml_file_path: str, base_folder: str = "output_llm", output_path: str = None) -> str:
