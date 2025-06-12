@@ -57,7 +57,8 @@ verification_system_instructions = """
 You are an expert image analysis assistant. Your task is to evaluate the provided 2D bounding boxes against the given image.
 The bounding boxes are provided as a JSON string, where each box has a "label" and "box_2d" coordinates.
 The "box_2d" coordinates are in the format [y1, x1, y2, x2] and are normalized to 1000 (e.g., a y1 of 500 means the top edge is at the vertical midpoint of the image).
-The bounding boxes extracted should be related to the single components and not composition of objects, labels or structural elements.
+The bounding boxes extracted should be related to the single components and not composition of objects.
+Labels should not be part of the bounding boxes.
 
 Carefully examine the image and the bounding boxes.
 Determine if the bounding boxes are:
@@ -140,7 +141,7 @@ def detect_objects_in_image(img_path: str, user_prompt: str = "Detect the 2d bou
 
         langfuse_context.update_current_observation(
             input=[user_prompt, im],
-            model=model_name,
+            model=GEMINI_MODEL_NAME,
             usage_details={
                 "input": response.usage_metadata.prompt_token_count,
                 "output": response.usage_metadata.candidates_token_count,
@@ -223,7 +224,7 @@ def adjust_bounding_boxes_in_image(img_path: str, existing_bounding_boxes_json_s
 
         langfuse_context.update_current_observation(
             input=prompt_for_adjustment,
-            model=model_name, # Or your specific adjustment model if different
+            model=GEMINI_MODEL_NAME, # Or your specific adjustment model if different
             usage_details={
                 "input": response.usage_metadata.prompt_token_count,
                 "output": response.usage_metadata.candidates_token_count,
@@ -368,7 +369,7 @@ def verify_bounding_boxes(
 
         langfuse_context.update_current_observation(
             input=prompt_parts,
-            model=model_name,
+            model=GEMINI_MODEL_NAME,
             usage_details={
                 "input": response.usage_metadata.prompt_token_count,
                 "output": response.usage_metadata.candidates_token_count,
